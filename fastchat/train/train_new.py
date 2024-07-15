@@ -29,7 +29,8 @@ from transformers.trainer_pt_utils import LabelSmoother
 
 from fastchat.conversation import SeparatorStyle
 from fastchat.model.model_adapter import get_conversation_template
-
+from datasets import load_dataset, interleave_datasets, concatenate_datasets
+import random
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 
@@ -95,18 +96,38 @@ def preprocess(
 ) -> Dict:
     conv = get_conversation_template("vicuna")
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
     # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
+        if source[0]["from"] not in roles:
+            print(f"Skipping source with unrecognized role '{source[0]['from']}' at index {i}")
+            continue
         if roles[source[0]["from"]] != conv.roles[0]:
             # Skip the first one if it is not from human
             source = source[1:]
-
+            if len(source) == 0 or "from" not in source[0] or source[0]["from"] not in roles:
+                print(f"Skipping improperly formatted source after trimming at index {i}: {source}")
+                continue
+           
         conv.messages = []
         for j, sentence in enumerate(source):
-            role = roles[sentence["from"]]
-            assert role == conv.roles[j % 2], f"{i}"
+            sender = sentence["from"]
+    
+    # Check if the sender is in the roles dictionary
+            if sender in roles:
+                role = roles[sender]
+            else:
+                # Handle the case where the sender is not found in roles
+                # You can either skip the sentence, assign a default role, or log an error
+                print(f"Warning: Unknown sender '{sender}' encountered. Skipping sentence.")
+                continue  # Skip to the next sentence if the sender is unknown
+            # role = roles[sentence["from"]]
+            #assert role == conv.roles[j % 2], f"{i}"
+            if role != conv.roles[j % 2]:
+                # Handle the mismatch, e.g., log a warning or error, or skip the sentence
+                print(f"Warning: Role mismatch at index {j} in conversation {i}. Expected role: {conv.roles[j % 2]}, Actual role: {role}")
+                # You could also choose to continue to the next iteration to skip this sentence
+                continue
             conv.append_message(role, sentence["value"])
         conversations.append(conv.get_prompt())
 
@@ -231,7 +252,70 @@ class LazySupervisedDataset(Dataset):
 
         return ret
 
+class ExhaustiveCombinedDataset(Dataset):
+    def __init__(self, dataset1, dataset2, probabilities=[0.2, 0.8]):
+        super().__init__()
+        self.dataset1 = dataset1
+        self.dataset2 = dataset2
+        self.probabilities = probabilities
 
+    def __len__(self):
+        # Length of the combined dataset is the sum of lengths of both individual datasets
+        return len(self.dataset1) + len(self.dataset2)
+
+    def __getitem__(self, idx):
+        # Randomly choose between dataset1 and dataset2 based on the given probabilities
+        if random.random() < self.probabilities[0]:
+            # If chosen dataset1, perform uniform sampling
+            index = random.randint(0, len(self.dataset1) - 1)
+            return self.dataset1[index]
+        else:
+            # If chosen dataset2, simply return the item at the current index (if available),
+            # otherwise, wrap around to the start of the dataset.
+            if idx < len(self.dataset2):
+                return self.dataset2[idx]
+            else:
+                index = idx % len(self.dataset2)
+                return self.dataset2[index]
+class CombinedDataset(Dataset):
+    def __init__(self, dataset1, dataset2):
+        """
+        Initialize the CombinedDataset with two datasets.
+        
+        Args:
+            dataset1 (Dataset): The first dataset.
+            dataset2 (Dataset): The second dataset.
+        """
+        self.dataset1 = dataset1
+        self.dataset2 = dataset2
+        self.length1 = len(dataset1)
+        self.length2 = len(dataset2)
+        self.total_length = self.length1 + self.length2
+
+    def __len__(self):
+        """
+        Returns the total length of the combined dataset.
+        
+        Returns:
+            int: Total number of samples in the combined dataset.
+        """
+        return self.total_length
+
+    def __getitem__(self, idx):
+        """
+        Get an item from the combined dataset.
+        
+        Args:
+            idx (int): Index of the item to retrieve.
+        
+        Returns:
+            Any: The item from the combined dataset.
+        """
+        if idx < self.length1:
+            return self.dataset1[idx]
+        else:
+            idx = idx - self.length1
+            return self.dataset2[idx]        
 def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer, data_args
 ) -> Dict:
@@ -240,9 +324,52 @@ def make_supervised_data_module(
         LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
     )
     rank0_print("Loading data...")
+    task_name = ['os','db','alfworld','webshop','kg','mind2web']
+    ds = []
+    for i in task_name:
+        ds_s = load_dataset("THUDM/AgentInstruct",split=i)
+        ds.append(ds_s)
+    train_json = concatenate_datasets(ds)
+    train_json_sg = json.load(open(data_args.data_path, "r"))
+    train_at = dataset_cls(train_json, tokenizer=tokenizer)
+    train_sg = dataset_cls(train_json_sg, tokenizer=tokenizer)
+    #train_dataset = ExhaustiveCombinedDataset(train_at,train_sg)
+    train_dataset = CombinedDataset(train_at,train_sg)
+    print('----------\n','construted random sample dataset')
+    # print('train_json_sg',train_json_sg.features)
+    # train_json_sg = load_dataset('json',data_files=data_args.data_path,split='train') #json.load(open(data_args.data_path, "r"))
+    # print('train_json_sg',train_json_sg.features)
+    # print('train_json',train_json.features)
+    # from datasets import Value, Features
+    # target_features = Features({
+    # 'conversations': [{
+    #     'from': Value('string'),
+    #     'loss': Value('bool'),
+    #     'value': Value('string')
+    # }],
+    # 'id': Value('string')
+    # })
 
-    train_json = json.load(open(data_args.data_path, "r"))
-    train_dataset = dataset_cls(train_json, tokenizer=tokenizer)
+    # # Transform dataset_sg to match the target features
+    # def transform_sg_to_match(example):
+    #     # Remove 'markdown' and add 'loss'
+    #     transformed_conversations = []
+    #     for conv in example['conversations']:
+    #         transformed_conv = {
+    #             'from': conv['from'],
+    #             'loss': None,  # or any default value you'd like
+    #             'value': conv['value']
+    #         }
+    #         transformed_conversations.append(transformed_conv)
+    #     example['conversations'] = transformed_conversations
+    #     return example
+
+    # # Apply the transformation
+    # train_json_sg = train_json_sg.map(transform_sg_to_match, features=target_features)
+    # print('new train_json_sg features',train_json_sg.features)
+    # train_json_inter = interleave_datasets([train_json,train_json_sg],probabilities=[0.2,0.8])
+    # print('load_ds from hf')
+    #train_dataset = dataset_cls(train_json_inter, tokenizer=tokenizer)
 
     if data_args.eval_data_path:
         eval_json = json.load(open(data_args.eval_data_path, "r"))
@@ -295,7 +422,6 @@ def train():
 
     # Load data
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-
     # Start trainner
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
